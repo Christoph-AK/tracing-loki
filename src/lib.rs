@@ -76,10 +76,10 @@ use tracing_subscriber::layer::Context as TracingContext;
 use tracing_subscriber::registry::LookupSpan;
 use url::Url;
 
-use ErrorInner as ErrorI;
 use level_map::LevelMap;
 use log_support::SerializeEventFieldMapStrippingLog;
 use no_subscriber::NoSubscriber;
+use ErrorInner as ErrorI;
 
 mod level_map;
 mod log_support;
@@ -378,6 +378,8 @@ impl BackgroundTask {
         receiver: mpsc::Receiver<LokiEvent>,
         labels: &mut HashMap<String, String>,
     ) -> Result<BackgroundTask, Error> {
+        println!("init log levels");
+
         fn level_str(level: Level) -> &'static str {
             match level {
                 Level::TRACE => "trace",
@@ -391,35 +393,55 @@ impl BackgroundTask {
         if labels.contains_key("label") {
             return Err(Error(ErrorI::ReservedLabelLevel));
         }
+
+        println!("set receiver");
+        let receiver = ReceiverStream::new(receiver);
+
+        println!("set loki url");
+        let loki_url = loki_url
+            .join("/loki/api/v1/push")
+            .map_err(|_| Error(ErrorI::InvalidLokiUrl))?;
+
+        println!("set queues");
+        let queues = LevelMap::try_from_fn(|level| {
+            labels.insert("level".into(), level_str(level).into());
+            let labels_encoded = labels_to_string(labels)?;
+            labels.remove("level");
+            Ok(SendQueue::new(labels_encoded))
+        })?;
+
+        println!("set buffer");
+        let buffer = Buffer::new();
+
+        println!("set http_client");
+        let http_client = reqwest::Client::builder()
+            .user_agent(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .redirect(reqwest::redirect::Policy::custom(|a| {
+                let status = a.status().as_u16();
+                if status == 302 || status == 303 {
+                    let to = a.url().clone();
+                    return a.error(BadRedirect { status, to });
+                }
+                reqwest::redirect::Policy::default().redirect(a)
+            }))
+            .build()
+            .expect("reqwest client builder");
+
+        println!("set backoff_count");
+        let backoff_count = 0;
+
+        println!("set background task");
         Ok(BackgroundTask {
-            receiver: ReceiverStream::new(receiver),
-            loki_url: loki_url
-                .join("/loki/api/v1/push")
-                .map_err(|_| Error(ErrorI::InvalidLokiUrl))?,
-            queues: LevelMap::try_from_fn(|level| {
-                labels.insert("level".into(), level_str(level).into());
-                let labels_encoded = labels_to_string(labels)?;
-                labels.remove("level");
-                Ok(SendQueue::new(labels_encoded))
-            })?,
-            buffer: Buffer::new(),
-            http_client: reqwest::Client::builder()
-                .user_agent(concat!(
-                    env!("CARGO_PKG_NAME"),
-                    "/",
-                    env!("CARGO_PKG_VERSION")
-                ))
-                .redirect(reqwest::redirect::Policy::custom(|a| {
-                    let status = a.status().as_u16();
-                    if status == 302 || status == 303 {
-                        let to = a.url().clone();
-                        return a.error(BadRedirect { status, to });
-                    }
-                    reqwest::redirect::Policy::default().redirect(a)
-                }))
-                .build()
-                .expect("reqwest client builder"),
-            backoff_count: 0,
+            receiver,
+            loki_url,
+            queues,
+            buffer,
+            http_client,
+            backoff_count,
             backoff: None,
             send_task: None,
         })
